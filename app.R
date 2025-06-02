@@ -7,6 +7,7 @@
 #    https://shiny.posit.co/
 #
 
+
 library(shiny)
 library(tidyverse)
 library(shinythemes)
@@ -16,8 +17,60 @@ library(networkD3)
 library(devtools)
 library(ggsankey)
 library(lubridate)
+library(showtext)
+library(tigris)
+library(stringr)
+library(sf)
+library(tmap)
+library(lubridate)
+
+
 
 energyOverviewRaw <- read.csv("MER_T01_03.csv")
+
+# state level yearly consumption
+stateData <- read.csv("statedata.csv")
+stateData <- stateData %>%
+  mutate(State = str_trim(State))
+
+
+## gets state info with polygon
+#states <- states(cb = TRUE)
+## renames col
+#states$State <- states$STUSPS
+
+## extracts only the useful stuff
+#states <- states %>% select(State, geometry)
+#saveRDS(states, file = "states.rds")
+states <- readRDS("states.rds")
+
+
+## joins it to the state data
+joinedStates <- left_join(states, stateData, by = "State")
+## gets rid of territories that aren't included in the energy data
+joinedStates <- joinedStates %>% 
+  na.omit(joinedStates) %>% 
+  subset(State != "HI") %>% 
+  subset(State != "AK")
+
+
+# tidy data format
+stateData <- joinedStates %>%
+  pivot_longer(cols = -c("State", "geometry"),
+               names_to = "Year",
+               values_to = "Consumption") %>%
+  # fixes formatting
+  mutate(Year = parse_number(Year)) %>%
+  mutate(Years = as.numeric(Year)) %>%
+  mutate(Consumption = as.numeric(gsub(",", "", Consumption))) %>%
+  mutate(YearDate = ymd(Years, truncated = 2L))
+
+
+
+
+
+
+
 
 energyOverview <- energyOverviewRaw %>% 
   # make a new column  called year
@@ -33,6 +86,7 @@ energyOverview <- energyOverview %>%
   filter(Year > 1943)
 # check against data
 #https://www.eia.gov/totalenergy/data/browser/index.php?tbl=T01.03#/?f=A&start=2021&end=2022&charted=1-2-3-5-12
+
 
 
 # clean it up
@@ -74,6 +128,18 @@ energyOverview <- energyOverview %>%
 energyOverview <- energyOverview %>% rename(Source = Description, Quads = Value)
 
 energyOverview$YearDate <- ymd(energyOverview$Year, truncated = 2L)
+
+# color scheme
+
+## grab unique sources
+sources <- unique(energyOverview$Source)
+## sort alphabetically
+sources <- sort(sources)
+## palette
+revcol <- rev(pnw_palette("Bay", length(sources)))
+
+palette <- setNames(revcol, sources)
+
 
 
 #tables <- energyOverview %>%
@@ -117,8 +183,7 @@ ui <- fluidPage(
     
     mainPanel(
       fluidRow(
-        column(4, tableOutput("consumptionTable")),
-        column(4, tableOutput("mixTable"))
+        column(8, tableOutput("consumptionTable"))
         
         
       ) # closes fluid row
@@ -133,7 +198,7 @@ ui <- fluidPage(
   
   sidebarLayout(
     # First row containing the product, selecting code and title
-    sidebarPanel(selectInput("Source", "Source",
+    sidebarPanel(selectInput("Source1", "Source",
                              choices = c("All", energyOverview$Source),
                              width = "100%",
                              selected = "All"
@@ -204,7 +269,7 @@ ui <- fluidPage(
   # SANKEY
   sidebarLayout(
     # First row containing the product, selecting code and title
-    sidebarPanel(selectInput("Source", "Source",
+    sidebarPanel(selectInput("Source2", "Source",
                              choices = c("All", energyOverview$Source),
                              width = "100%",
                              selected = 'All'
@@ -230,9 +295,37 @@ ui <- fluidPage(
         
       ) # closes fluid row
     ) # closes main panel
-  ) # closes sidebar
+  ), # closes sidebar
         
+
+
+h3("Consumption by Location"),
+p("Below is a map that details the yearly consumption per capita (in millions of Btus) over time. The slider allows the user to select the year. NOTE: the breaks are different every year, which can be misleading. This will be fixed in the final app."),
+hr(),
+
+# map
+sidebarLayout(
+  # First row containing the product, selecting code and title
+  sidebarPanel(sliderInput("YearDate5", "Select Date Year",
+                           min = min(stateData$Year),
+                           max = max(stateData$Year),
+                           value = min(stateData$Year),
+                           step = 1,
+                           sep = ""
+  )),
+  
+  
+  mainPanel(
+    fluidRow(
+      column(12, tmapOutput("map"))
+      
+      
+    ) # closes fluid row
+  ) # closes main panel
+) # closes sidebar
+
 )
+
 
 server <- function(input, output, session) {
   
@@ -246,21 +339,17 @@ server <- function(input, output, session) {
     tableDateFilter() %>%
       mutate(Quads = str_replace(Quads, "Not Available", "0"),
              # removes the NA values in character format
-             QuadsN = as.double(Quads)) %>%
-      group_by(Source) %>%
-        summarise(Quads = sum(QuadsN))
-  })
-  
-  output$mixTable <- renderTable({
-    tableDateFilter() %>%
-      mutate(Quads = str_replace(Quads, "Not Available", "0"),
-             # removes the NA values in character format
              QuadsN = as.double(Quads),
              QuadsNSum = sum(QuadsN),
              Percentage = QuadsN/QuadsNSum) %>%
       group_by(Source) %>%
-      summarise(Percentage = sum(Percentage))
+        summarise(Quads = sum(QuadsN),
+                  Percentage = sum(Percentage)) %>%
+      mutate(Percentage = 100 * Percentage)
+        
   })
+  
+
   
   
 
@@ -290,11 +379,11 @@ server <- function(input, output, session) {
     output$consumptionPlot <- renderPlot({
       
       df <- plotDateFilter() 
-      filteredPlotData <- if (input$Source == "All") {
+      filteredPlotData <- if (input$Source1 == "All") {
         df
       } else {
         df %>%
-          filter(Source == input$Source)
+          filter(Source == input$Source1)
       }
       
       
@@ -306,7 +395,7 @@ server <- function(input, output, session) {
       
       
       scale_fill_manual(name = "Energy Source",
-                        values = rev(pnw_palette("Bay", 9))) +
+                        values = palette) +
       # color scheme for the fill
       
       
@@ -380,7 +469,7 @@ server <- function(input, output, session) {
       
       
       scale_fill_manual(name = "Energy Source",
-                        values = rev(pnw_palette("Bay", 9))) +
+                        values = palette) +
       # color scheme for the fill
       
       
@@ -436,11 +525,11 @@ server <- function(input, output, session) {
   output$sankey <- renderPlot({
     
     df <- sankeyDateFilter() 
-    filteredPlotData <- if (input$Source == "All") {
+    filteredPlotData <- if (input$Source2 == "All") {
       df
     } else {
       df %>%
-        filter(Source == input$Source)
+        filter(Source == input$Source2)
     }
   
     
@@ -454,7 +543,7 @@ server <- function(input, output, session) {
       geom_sankey_bump(smooth = 3) +
       
       scale_fill_manual(name = "Energy Source",
-                        values = rev(pnw_palette("Bay", 9))) +
+                        values = palette) +
       # color scheme for the fill
       
       
@@ -486,7 +575,55 @@ server <- function(input, output, session) {
     
     
   })
+  
+  stateDataFiltered <- reactive({
+    stateData %>%
+      filter(Year == input$YearDate5)
+    })
+  
+  
+ # output$map <- renderPlot({
+    
+#    font_add_google(name = "Cabin Condensed")
+    # adds font
+    
+#    stateDataFiltered() %>%
+ #     ggplot(mapping=aes(fill = Consumption)) +
+      # fills for the percentage
+  #    geom_sf(linewidth = .5, color = "#56382E") +
+      # line color and width
+ #     theme_minimal() +
+#      labs(title = "Yearly Energy Consumption per Capita", subtitle = "in million BTU") +
+      # labels
+#      theme(panel.grid = element_blank(),
+            
+      #      axis.text.y = element_blank(),
+     #      axis.ticks.y = element_blank(), 
+    #       axis.text.x = element_blank(),
+   #        axis.ticks.x = element_blank(),
+            # no x or y axis labels
+            
+  #          plot.background = element_rect(fill = "#FAF9F6", color = "#56382E", linewidth = 2),
+            # background colors
+            
+ #           text = element_text(family = "Cabin Condensed", color = "#56382E")) +
+      # text sizes and font
+      
+#     scale_fill_gradientn(colors = rev(pnw_palette(name="Anemone",n=8,type="continuous"))#                           #colors
+#    )
+# })
+  
 
+
+  output$map <- renderTmap(tm_basemap("Esri.WoldTopoMap") +
+                             tm_shape(stateDataFiltered()) +
+                            tm_polygons(col = "Consumption",
+                                        palette = rev(pnw_palette("Moth")),
+                                        style = "jenks",
+                                        alpha = 0.9,
+                                        id = "Consumption",
+                                        border.col = "#56382E"))
+  
 }
 
 # Run the application 
